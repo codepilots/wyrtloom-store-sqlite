@@ -237,6 +237,29 @@ impl PersistenceProvider for SqliteStore {
         Ok(())
     }
 
+    fn put_if_absent(&self, collection: &str, record: Record) -> Result<bool, StoreError> {
+        let name = Self::checked_collection(collection)?;
+        // Collection must have been declared.
+        self.declared_fields(name)?;
+
+        let doc = serde_json::to_string(&record.doc)
+            .map_err(|_| StoreError::Storage("serialize doc failed".into()))?;
+
+        let conn = lock(&self.conn)?;
+        // Single atomic statement: insert only if `id` is absent. On a primary-key
+        // conflict the row is left untouched (the FIRST doc wins — never overwritten),
+        // so there is no TOCTOU window as there would be with get-then-put. Combined
+        // with WAL (set in `open`) this is safe across connections/processes.
+        conn.execute(
+            &format!("INSERT INTO \"{name}\" (id, doc) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING"),
+            params![record.id, doc],
+        )
+        .map_err(|_| StoreError::Storage("insert failed".into()))?;
+        // `changes()` reports rows affected by the most recent statement: 1 means the
+        // row was inserted (id was absent), 0 means the id already existed.
+        Ok(conn.changes() == 1)
+    }
+
     fn get(&self, collection: &str, id: &str) -> Result<Record, StoreError> {
         let name = Self::checked_collection(collection)?;
         self.declared_fields(name)?;
@@ -790,6 +813,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx_count, 2);
+    }
+
+    #[test]
+    fn put_if_absent_inserts_then_refuses_duplicate_first_doc_wins() {
+        let s = store_with_users();
+        // First insert: id absent -> true.
+        assert!(s
+            .put_if_absent("users", rec("u1", json!({"username": "first"})))
+            .unwrap());
+        // Second insert with the same id: already present -> false, and the
+        // stored doc must remain the FIRST one (not overwritten).
+        assert!(!s
+            .put_if_absent("users", rec("u1", json!({"username": "second"})))
+            .unwrap());
+        let got = s.get("users", "u1").unwrap();
+        assert_eq!(got.doc, json!({"username": "first"}));
+        assert_eq!(s.query("users", &Query::All).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn put_if_absent_undeclared_collection_fails() {
+        let s = SqliteStore::in_memory().unwrap();
+        assert!(matches!(
+            s.put_if_absent("widgets", rec("x", json!({}))).unwrap_err(),
+            StoreError::CollectionNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn put_if_absent_invalid_collection_rejected() {
+        let s = store_with_users();
+        assert!(matches!(
+            s.put_if_absent("users); DROP TABLE users--", rec("x", json!({})))
+                .unwrap_err(),
+            StoreError::InvalidIdentifier(_)
+        ));
+    }
+
+    #[test]
+    fn put_if_absent_is_atomic_under_concurrency() {
+        use std::sync::Arc;
+        // Shared store (one connection + mutex) so every thread races for the same id.
+        // Use an on-disk temp file with WAL to exercise the real single-statement path.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wyrtloom_store_pia_{}.db", std::process::id()));
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = Arc::new(SqliteStore::open(&path_str).unwrap());
+        store
+            .ensure_collection(&CollectionSpec {
+                name: "tokens".into(),
+                indexed_fields: vec![],
+            })
+            .unwrap();
+
+        const N: usize = 32;
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Line all threads up before the race to maximise contention.
+                    barrier.wait();
+                    store
+                        .put_if_absent("tokens", rec("single-use", json!({"by": i})))
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        let winners = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|&inserted| inserted)
+            .count();
+
+        // Exactly one thread may have observed the id as absent (single-use token).
+        assert_eq!(winners, 1);
+        // And exactly one row exists.
+        assert_eq!(store.query("tokens", &Query::All).unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 
     #[test]

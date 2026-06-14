@@ -2,6 +2,16 @@
 
 All notable changes to `wyrtloom-store-sqlite` are documented here.
 
+## [Unreleased]
+
+### Added
+- `put_if_absent`: an atomic override of the new `PersistenceProvider` trait
+  method (the default is a racy get-then-put). Implemented as a single
+  `INSERT ... ON CONFLICT(id) DO NOTHING` statement, returning `true` when the
+  row was inserted (id absent) and `false` when the id already existed; the
+  first doc wins and is never overwritten. Combined with WAL this is safe across
+  connections/processes and backs single-use tokens.
+
 ## [0.1.0] - 2026-06-14
 
 Initial release: a SQLite-backed implementation of the
