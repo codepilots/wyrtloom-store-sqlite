@@ -31,19 +31,28 @@ pub struct SqliteStore {
     specs: Mutex<HashMap<String, Vec<String>>>,
 }
 
+/// Map a poisoned-lock error to a `StoreError` instead of panicking, so a thread
+/// that panicked while holding a lock degrades into a clean error for callers
+/// rather than cascading panics (mirrors the sibling clientauth crate).
+fn lock<'a, T>(m: &'a Mutex<T>) -> Result<std::sync::MutexGuard<'a, T>, StoreError> {
+    m.lock()
+        .map_err(|_| StoreError::Storage("lock poisoned".into()))
+}
+
 impl SqliteStore {
     /// Open (or create) a store at `path`. The path is validated against traversal
     /// (`..`). Pass `":memory:"` for an in-memory store.
-    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
+    pub fn open(path: &str) -> Result<Self, StoreError> {
         let conn = if path == ":memory:" {
-            Connection::open_in_memory()?
+            Connection::open_in_memory()
+                .map_err(|_| StoreError::Storage("open in-memory failed".into()))?
         } else {
-            validate_db_path(path)
-                .map_err(|e| rusqlite::Error::InvalidPath(std::path::PathBuf::from(e)))?;
-            Connection::open(path)?
+            validate_db_path(path).map_err(|e| StoreError::Storage(format!("invalid path: {e}")))?;
+            Connection::open(path).map_err(|_| StoreError::Storage("open database failed".into()))?
         };
         // WAL + busy_timeout for safe two-process access.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|_| StoreError::Storage("configure pragmas failed".into()))?;
         let store = Self {
             conn: Mutex::new(conn),
             specs: Mutex::new(HashMap::new()),
@@ -54,38 +63,53 @@ impl SqliteStore {
     }
 
     /// Open a fresh in-memory store.
-    pub fn in_memory() -> Result<Self, rusqlite::Error> {
+    pub fn in_memory() -> Result<Self, StoreError> {
         Self::open(":memory:")
     }
 
     /// Create the metadata catalog used to persist declared collection specs, so
     /// collections (and their indexed-field allow-list) survive a reopen of a
     /// disk-backed database.
-    fn init_schema(&self) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute_batch(
-            "CREATE TABLE IF NOT EXISTS __wyrtloom_collections (
+    fn init_schema(&self) -> Result<(), StoreError> {
+        lock(&self.conn)?
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS __wyrtloom_collections (
                 name           TEXT PRIMARY KEY,
                 indexed_fields TEXT NOT NULL
             );",
-        )
+            )
+            .map_err(|_| StoreError::Storage("init schema failed".into()))
     }
 
     /// Repopulate the in-memory spec allow-list from the persisted catalog so a
     /// reopened database exposes its previously declared collections without
     /// requiring `ensure_collection` to be called again.
-    fn load_specs(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT name, indexed_fields FROM __wyrtloom_collections")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut specs = self.specs.lock().unwrap();
+    fn load_specs(&self) -> Result<(), StoreError> {
+        let conn = lock(&self.conn)?;
+        let mut stmt = conn
+            .prepare("SELECT name, indexed_fields FROM __wyrtloom_collections")
+            .map_err(|_| StoreError::Storage("load specs: prepare failed".into()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| StoreError::Storage("load specs: query failed".into()))?;
+        let mut specs = lock(&self.specs)?;
         for row in rows {
-            let (name, fields_json) = row?;
+            let (name, fields_json) =
+                row.map_err(|_| StoreError::Storage("load specs: row read failed".into()))?;
             // A corrupt catalog row would otherwise poison every later operation;
             // skip names/fields that no longer validate as identifiers.
-            let fields: Vec<String> = serde_json::from_str(&fields_json).unwrap_or_default();
+            //
+            // A malformed `indexed_fields` JSON is NOT silently coerced to an empty
+            // allow-list: doing so would let previously-valid `ByField` queries start
+            // returning `FieldNotIndexed` after a reopen. Fail loud (integrity error),
+            // consistent with the crate's other integrity-error handling.
+            let fields: Vec<String> = serde_json::from_str(&fields_json).map_err(|_| {
+                StoreError::Storage(format!(
+                    "integrity error: malformed indexed_fields in catalog for collection {name:?}"
+                ))
+            })?;
             if is_valid_identifier(&name) && fields.iter().all(|f| is_valid_identifier(f)) {
                 specs.insert(name, fields);
             }
@@ -104,7 +128,7 @@ impl SqliteStore {
 
     /// Look up the declared indexed fields for a known collection.
     fn declared_fields(&self, collection: &str) -> Result<Vec<String>, StoreError> {
-        let specs = self.specs.lock().unwrap();
+        let specs = lock(&self.specs)?;
         specs
             .get(collection)
             .cloned()
@@ -151,7 +175,7 @@ impl PersistenceProvider for SqliteStore {
             }
         }
 
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn)?;
 
         // `name` is a validated identifier ([a-z0-9_], <=64). Safe to interpolate.
         conn.execute_batch(&format!(
@@ -192,10 +216,7 @@ impl PersistenceProvider for SqliteStore {
         .map_err(|_| StoreError::Storage("persist spec failed".into()))?;
         drop(conn);
 
-        self.specs
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), spec.indexed_fields.clone());
+        lock(&self.specs)?.insert(name.to_string(), spec.indexed_fields.clone());
         Ok(())
     }
 
@@ -207,7 +228,7 @@ impl PersistenceProvider for SqliteStore {
         let doc = serde_json::to_string(&record.doc)
             .map_err(|_| StoreError::Storage("serialize doc failed".into()))?;
 
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn)?;
         conn.execute(
             &format!("INSERT OR REPLACE INTO \"{name}\" (id, doc) VALUES (?1, ?2)"),
             params![record.id, doc],
@@ -220,7 +241,7 @@ impl PersistenceProvider for SqliteStore {
         let name = Self::checked_collection(collection)?;
         self.declared_fields(name)?;
 
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn)?;
         let doc: Option<String> = conn
             .query_row(
                 &format!("SELECT doc FROM \"{name}\" WHERE id = ?1"),
@@ -248,7 +269,7 @@ impl PersistenceProvider for SqliteStore {
         let name = Self::checked_collection(collection)?;
         let declared = self.declared_fields(name)?;
 
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn)?;
 
         // Build the statement. Identifiers are validated/allow-listed; values bound.
         let (sql, bind): (String, Vec<rusqlite::types::Value>) = match query {
@@ -318,7 +339,7 @@ impl PersistenceProvider for SqliteStore {
         let name = Self::checked_collection(collection)?;
         self.declared_fields(name)?;
 
-        let conn = self.conn.lock().unwrap();
+        let conn = lock(&self.conn)?;
         // DELETE of an absent row affects 0 rows and is a no-op, as required.
         conn.execute(
             &format!("DELETE FROM \"{name}\" WHERE id = ?1"),
@@ -689,6 +710,45 @@ mod tests {
         }
 
         std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    #[test]
+    fn malformed_catalog_indexed_fields_surfaces_on_reopen() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wyrtloom_store_badcat_{}.db", std::process::id()));
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let s = SqliteStore::open(&path_str).unwrap();
+            s.ensure_collection(&CollectionSpec {
+                name: "users".into(),
+                indexed_fields: vec!["role".into()],
+            })
+            .unwrap();
+            s.put("users", rec("u1", json!({"username": "alice", "role": "admin"})))
+                .unwrap();
+            // Corrupt the persisted indexed_fields JSON for the collection.
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE __wyrtloom_collections SET indexed_fields = ?1 WHERE name = ?2",
+                params!["{not valid json", "users"],
+            )
+            .unwrap();
+        } // store dropped — simulate process exit
+
+        // Reopen must NOT silently drop the indexes (which would make the previously
+        // valid `role` query start returning FieldNotIndexed). Instead it surfaces an
+        // integrity error.
+        match SqliteStore::open(&path_str) {
+            Err(StoreError::Storage(m)) if m.contains("integrity error") => {}
+            Err(e) => panic!("expected integrity error, got {e:?}"),
+            Ok(_) => panic!("expected integrity error, but reopen succeeded"),
+        }
+
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
         let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
